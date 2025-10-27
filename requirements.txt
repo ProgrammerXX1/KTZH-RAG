@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+weaviate-client>=4.6.0
+sentence-transformers
+numpy
+tqdm
+httpx
+python-multipart

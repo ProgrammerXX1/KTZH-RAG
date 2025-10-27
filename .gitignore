@@ -1,0 +1,31 @@
+# Ignore Python virtual environments
+.venv/
+venv/
+.github/
+
+
+
+python_pdf_ai/
+
+# Ignore JetBrains IDE files
+.idea/
+
+.env
+
+.github
+
+__pycache__/
+
+*.pyc
+chunks.json
+
+paged_rag/results_save
+paged_rag/uploads
+paged_rag/core/dependency.py
+QA_TEST_Results.txt
+RETRIEVE_RESULT.txt
+RETRIEVE_TEST.txt
+save_res.pkl
+
+tempt.txt
+paged_rag/tempt.py
