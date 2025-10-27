@@ -42,6 +42,7 @@ def render_system_prompt() -> str:
         "Не придумывай числа и единицы."
     )
 
+
 def render_user_prompt(question: str, evidences: List[Evidence]) -> str:
     blocks = []
     for e in evidences:
