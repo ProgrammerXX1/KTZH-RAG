@@ -18,7 +18,7 @@ class ChunkMetadata(BaseModel):
         "paragraph","parent_rule","list_item","table",
         "definition","abbreviation","appendix","appendix_table","section_title"
     ]
-    cross_references: List[str] = []
+    cross_references: List[str] = Field(default_factory=list)
 
 class Chunk(BaseModel):
     chunk_id: str = Field(..., description="PK, e.g. 854-ЦЗ-3.25")

@@ -1,6 +1,6 @@
 import os
-import httpx
-import asyncio
+import httpx, asyncio, json
+
 
 LLM_API_BASE = os.getenv("LLM_API_BASE", "http://92.46.59.74:8000/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "local")
@@ -9,7 +9,7 @@ LLM_MODEL   = os.getenv("LLM_MODEL", "qwen3-next-80b-a3b")
 async def _post(payload: dict) -> dict:
     url = f"{LLM_API_BASE}/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type":"application/json"}
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(url, headers=headers, json=payload)
         # не бросаем сразу — отдадим тело для диагностики
         return {"status": resp.status_code, "json": (await resp.aread()).decode("utf-8", "ignore")}

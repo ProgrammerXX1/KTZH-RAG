@@ -8,3 +8,6 @@ numpy
 tqdm
 httpx
 python-multipart
+pdfplumber 
+python-docx 
+requests

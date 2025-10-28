@@ -18,7 +18,7 @@ from .config import (
     ONLY_LATEST_REV,
     MONODOC_MARGIN,
 )
-from .embedder import embed_texts
+from .embedder import embed_texts, embed_query as _cached_embed_query
 from .models import Chunk, Evidence
 
 _CHUNK_TYPES = (
@@ -353,8 +353,7 @@ def _parse_date(s) -> datetime:
 
 async def _embed_query(q: str) -> list[float]:
     """Эмбеддинг для текста запроса (одним вызовом, без внешних зависимостей)."""
-    vec = await embed_texts([f"query: {q}"], batch_size=1)
-    return vec[0].tolist()
+    return (await _cached_embed_query(q)).tolist()
 
 
 def _alpha_for_query(q: str) -> float:
@@ -413,7 +412,7 @@ async def _hybrid_search(
             "parent_rule_number",
         ],
         filters=weaviate.classes.query.Filter.all_of(fltrs),
-        return_metadata=MetadataQuery(score=True),  # ← просим вектор
+        return_metadata=MetadataQuery(score=True,vector=True),  # ← просим вектор
     )
 
     # 3) Преобразуем объекты
@@ -421,11 +420,11 @@ async def _hybrid_search(
     for o in res.objects:
         row = o.properties
         row["_score"] = getattr(o.metadata, "score", None)
-        # try:
-        #     vec = getattr(o.metadata, "vector", None)
-        #     row["_vec"] = np.array(vec, dtype=np.float32) if vec is not None else None
-        # except Exception:
-        #     row["_vec"] = None
+        try:
+            vec = getattr(o.metadata, "vector", None)
+            row["_vec"] = np.array(vec, dtype=np.float32) if vec is not None else None
+        except Exception:
+            row["_vec"] = None
         rows.append(row)
 
     # 4) Оставляем только последнюю редакцию документа (если надо)
@@ -544,6 +543,7 @@ async def search(
     k_defs: int = 60,
     language: str | None = None,
     today: str = "9999-12-31",
+    doc_id: Optional[str] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Асинхронный поисковый вход — вызывай с await.
@@ -556,9 +556,9 @@ async def search(
     alpha = _alpha_for_query(query)
 
     with _client() as client:
-        rules_all = await _hybrid_search(client.collections.get(RULES), query, k_rules, lang, today_rfc3339, qvec, alpha)
-        defs_all = await _hybrid_search(client.collections.get(DEFS), query, min(k_defs, 30), lang, today_rfc3339, qvec, alpha)
-        abbr_all = await _hybrid_search(client.collections.get(ABBR), query, min(k_defs, 30), lang, today_rfc3339, qvec, alpha)
+        rules_all = await _hybrid_search(client.collections.get(RULES), query, k_rules, lang, today_rfc3339, qvec, alpha, doc_id)
+        defs_all  = await _hybrid_search(client.collections.get(DEFS),  query, min(k_defs, 30), lang, today_rfc3339, qvec, alpha, doc_id)
+        abbr_all  = await _hybrid_search(client.collections.get(ABBR),  query, min(k_defs, 30), lang, today_rfc3339, qvec, alpha, doc_id)
 
     # --- DOC TOP-N: выбираем 1–3 лучших документов по Rules и режем кандидатов по ним ---
     doc_rank = _aggregate_docs(rules_all)

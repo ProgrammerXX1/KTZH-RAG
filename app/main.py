@@ -23,6 +23,8 @@ from .retriever import (
     to_evidence,
     wipe_all,
 )
+from .parser.pars import router as parser_router
+
 
 # --- helpers: корректная кириллица в именах внутри ZIP ---
 UTF8_FLAG = 0x800  # general purpose bit 11 — "Language encoding flag (EFS)"
@@ -206,7 +208,7 @@ async def ingest_jsonl(file: UploadFile = File(...)) -> Dict[str, Any]:
 @app.post("/rag/answer")
 async def rag_answer(req: AnswerRequest) -> Dict[str, Any]:
     today = datetime.date.today().isoformat()
-    r = await search(req.query, req.k_rules, req.k_defs, language=req.language, today=today)
+    r = await search(req.query, req.k_rules, req.k_defs, language=req.language, today=today, doc_id=req.doc_id)
 
     # Кандидаты на якорь из Rules
     candidates = (r.get("rules") or [])
@@ -275,3 +277,6 @@ async def rag_answer(req: AnswerRequest) -> Dict[str, Any]:
     user = render_user_prompt(req.query, evid)
     out = await chat(system, user)
     return {"answer": out, "evidence": [e.model_dump() for e in evid]}
+
+
+app.include_router(parser_router)
