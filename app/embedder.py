@@ -1,89 +1,101 @@
-import asyncio
+# app/embedder.py
+from __future__ import annotations
+
+import sys, asyncio
 import numpy as np
-import httpx, time, sys, random
+import httpx
 from .config import EMBEDDER_API_BASE, EMBEDDER_API_KEY, EMBEDDER_MODEL
 
+# Кэш для запросных эмбеддингов (экономит latency при похожих вопросах)
 _query_cache: dict[str, np.ndarray] = {}
 
-def _norm_text(s: str) -> str:
-    # лёгкая нормализация, чтобы стабилизировать кэш и эмбеддинги
-    return " ".join((s or "").split())
+MAX_CHARS_PER_ITEM = 1600  # ~512 токенов
 
-async def embed_query(text: str) -> np.ndarray:
-    key = f"q::{_norm_text(text)}::{EMBEDDER_MODEL}"
-    if key in _query_cache:
-        return _query_cache[key]
-    vec = (await embed_texts([f"query: {_norm_text(text)}"], batch_size=1))[0]
-    _query_cache[key] = vec
-    return vec
+def _truncate(s: str, lim: int = MAX_CHARS_PER_ITEM) -> str:
+    if not isinstance(s, str):
+        s = str(s or "")
+    s = s.replace("\x00", " ").strip()
+    return s[:lim] if len(s) > lim else s
 
-async def _post_embeddings(client: httpx.AsyncClient, payload: dict, attempt: int) -> dict:
-    r = await client.post(
-        f"{EMBEDDER_API_BASE}/embeddings",
-        headers={"Authorization": f"Bearer {EMBEDDER_API_KEY}", "Content-Type": "application/json"},
-        json=payload,
-    )
-    # 429/5xx считаем ретраибельными
-    if r.status_code in (429, 500, 502, 503, 504):
-        raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
-    r.raise_for_status()
-    return r.json()
-
-async def embed_texts(texts: list[str], batch_size: int = 32) -> np.ndarray:
+async def embed_texts(texts: list[str], batch_size: int = 32) -> list[np.ndarray | None]:
+    """
+    Возвращает список эмбеддингов (np.ndarray | None) под каждый входной текст.
+    При ошибках/400 батч режется; для упрямых элементов делается повтор с укорочением.
+    """
+    texts = [_truncate(t) for t in texts]
     total = len(texts)
-    all_vecs: list[np.ndarray] = []
-    errors = []
-    start = time.time()
-    print(f"\nembedding {total} chunks via {EMBEDDER_MODEL}\n", flush=True)
-
-    # защита от пустого ввода
-    if total == 0:
-        return np.zeros((0, 1), dtype=np.float32)
-
-    # ограничим batch_size разумно
-    bsz = max(1, min(batch_size, 128))
+    out: list[np.ndarray | None] = [None] * total
+    print(f"\n🚀 embedding {total} items via {EMBEDDER_MODEL}...\n", flush=True)
 
     async with httpx.AsyncClient(timeout=120) as client:
-        for i in range(0, total, bsz):
-            batch = [_norm_text(t) for t in texts[i:i+bsz]]
-            payload = {"model": EMBEDDER_MODEL, "input": batch}
-
-            # до 3 попыток с экспоненциальным бэкоффом и джиттером
-            ok = False
-            last_err = None
-            for attempt in range(1, 4):
-                try:
-                    body = await _post_embeddings(client, payload, attempt)
-                    data = body.get("data") or []
-                    if len(data) != len(batch):
-                        raise RuntimeError(
-                            f"embeddings count mismatch: got {len(data)} for batch {len(batch)}; body={str(body)[:400]}"
+        i = 0
+        cur_bs = max(1, batch_size)
+        while i < total:
+            lo, hi = i, min(i + cur_bs, total)
+            batch = texts[lo:hi]
+            try:
+                r = await client.post(
+                    f"{EMBEDDER_API_BASE}/embeddings",
+                    headers={
+                        "Authorization": f"Bearer {EMBEDDER_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"model": EMBEDDER_MODEL, "input": batch},
+                )
+                if r.status_code == 400 and (hi - lo) > 1:
+                    # резать батч вдвое
+                    cur_bs = max(1, cur_bs // 2)
+                    continue
+                r.raise_for_status()
+                data = (r.json().get("data") or [])
+                if len(data) != len(batch):
+                    raise RuntimeError("shape_mismatch")
+                for j, d in enumerate(data):
+                    out[lo + j] = np.array(d["embedding"], dtype=np.float32)
+                i = hi
+                # плавно увеличиваем обратно, если всё ок
+                if cur_bs < batch_size:
+                    cur_bs = min(batch_size, cur_bs * 2)
+            except httpx.HTTPStatusError as e:
+                if e.response is not None and e.response.status_code == 400 and (hi - lo) == 1:
+                    # одиночный элемент — ещё сильнее укоротим и попробуем разок
+                    t2 = _truncate(batch[0], lim=MAX_CHARS_PER_ITEM // 2)
+                    try:
+                        r2 = await client.post(
+                            f"{EMBEDDER_API_BASE}/embeddings",
+                            headers={
+                                "Authorization": f"Bearer {EMBEDDER_API_KEY}",
+                                "Content-Type": "application/json",
+                            },
+                            json={"model": EMBEDDER_MODEL, "input": [t2]},
                         )
-                    vecs = [np.array(d["embedding"], dtype=np.float32) for d in data]
-                    all_vecs.extend(vecs)
-                    ok = True
-                    break
-                except Exception as e:
-                    last_err = e
-                    sleep_s = (0.4 * (2 ** (attempt - 1))) + random.uniform(0, 0.2)
-                    await asyncio.sleep(sleep_s)
+                        if 200 <= r2.status_code < 300:
+                            out[lo] = np.array(r2.json()["data"][0]["embedding"], dtype=np.float32)
+                        else:
+                            sys.stderr.write(f"\n⚠️ drop idx={lo} due to 400\n")
+                    except Exception:
+                        sys.stderr.write(f"\n⚠️ drop idx={lo} due to error\n")
+                    i = hi
+                else:
+                    await asyncio.sleep(0.4)
+            except Exception:
+                await asyncio.sleep(0.4)
 
-            if not ok:
-                errors.append(f"batch {i//bsz+1}: {repr(last_err)}")
+    done = sum(1 for v in out if v is not None)
+    print(f"\n✅ done {done}/{total} items\n", flush=True)
+    return out
 
-            done = min(i + bsz, total)
-            pct = done / total * 100
-            sys.stdout.write(f"\r[{done}/{total}] {pct:.1f}%")
-            sys.stdout.flush()
-
-    dur = time.time() - start
-    print(f"\nfinished {len(all_vecs)}/{total} in {dur:.1f}s\n", flush=True)
-
-    if errors and not all_vecs:
-        raise RuntimeError("embedder_failed: no vectors returned;\n" + "\n".join(errors))
-
-    if not all_vecs:
-        raise RuntimeError("embedder_failed: empty result")
-
-    # склеиваем по порядку
-    return np.vstack(all_vecs)
+async def embed_query(text: str) -> np.ndarray:
+    """
+    Эмбеддинг запроса (E5 требует префикс 'query: ').
+    Кэшируется в памяти.
+    """
+    t = _truncate(text, lim=1024)
+    key = f"q::{t}"
+    if key in _query_cache:
+        return _query_cache[key]
+    vec = (await embed_texts([f"query: {t}"], batch_size=1))[0]
+    if vec is None:
+        raise RuntimeError("embed_query_failed")
+    _query_cache[key] = vec
+    return vec

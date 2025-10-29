@@ -1,11 +1,16 @@
+# app/retriever.py
+from __future__ import annotations
+
 import json
-import urllib.parse as urlparse
-from typing import List, Dict, Any, Optional
 import re
+import sys
+import urllib.parse as urlparse
 from datetime import datetime, date
+from typing import Any, Dict, List, Optional
+
 import numpy as np
-from weaviate.classes.query import MetadataQuery
 import weaviate
+from weaviate.classes.query import MetadataQuery
 
 from .config import (
     WEAVIATE_URL,
@@ -18,102 +23,32 @@ from .config import (
     ONLY_LATEST_REV,
     MONODOC_MARGIN,
 )
-from .embedder import embed_texts, embed_query as _cached_embed_query
+from .embedder import embed_texts
 from .models import Chunk, Evidence
 
-_CHUNK_TYPES = (
-    "paragraph","parent_rule","list_item","table",
-    "definition","abbreviation","appendix","appendix_table","section_title"
-)
-
-def chunk_types_overview(limit_per_type: int = 3, doc_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Возвращает срез по коллекциям и chunk_type:
-    {
-      "Rules": {
-        "total": 123,
-        "by_type": {
-          "paragraph": {
-            "count": 100,
-            "samples": [ {chunk_id, chunk_type, source_document_id, ...}, ... ]
-          },
-          ...
-        }
-      },
-      "Definitions": { ... },
-      "Abbreviations": { ... }
-    }
-    Можно сузить по конкретному документу doc_id.
-    """
-    out: Dict[str, Any] = {}
-    with _client() as client:
-        for cls in (RULES, DEFS, ABBR):
-            if not client.collections.exists(cls):
-                out[cls] = {"total": 0, "by_type": {}}
-                continue
-
-            coll = client.collections.get(cls)
-
-            # общий total (с учётом doc_id, если задан)
-            base_filters = []
-            if doc_id:
-                base_filters.append(
-                    weaviate.classes.query.Filter.by_property("source_document_id").equal(doc_id)
-                )
-            base_filter = (weaviate.classes.query.Filter.all_of(base_filters)
-                           if base_filters else None)
-
-            if base_filter is None:
-                agg_total = coll.aggregate.over_all(total_count=True)
-            else:
-                agg_total = coll.aggregate.over_all(total_count=True, filters=base_filter)
-
-            total = int(getattr(agg_total, "total_count", 0))
-            by_type: Dict[str, Any] = {}
-
-            for t in _CHUNK_TYPES:
-                # where: (base_filters) AND (chunk_type == t)
-                fltrs = [weaviate.classes.query.Filter.by_property("chunk_type").equal(t)]
-                if base_filter is not None:
-                    fltrs.insert(0, base_filter)
-                    where = weaviate.classes.query.Filter.all_of(fltrs)
-                else:
-                    where = fltrs[0]
-
-                agg_t = coll.aggregate.over_all(total_count=True, filters=where)
-                cnt = int(getattr(agg_t, "total_count", 0))
-                if cnt <= 0:
-                    continue
-
-                # пары примеров по типу
-                res = coll.query.fetch_objects(
-                    limit=max(0, int(limit_per_type)),
-                    return_properties=[
-                        "chunk_id", "chunk_type", "source_document_id",
-                        "section_number", "chunk_rule_number", "parent_rule_number",
-                        "effective_date"
-                    ],
-                    filters=where,
-                )
-                samples = [o.properties for o in res.objects]
-                by_type[t] = {"count": cnt, "samples": samples}
-
-            out[cls] = {"total": total, "by_type": by_type}
-
-    return out
-
-# Классы
+# --- коллекции ---
 RULES = "Rules"
 DEFS = "Definitions"
 ABBR = "Abbreviations"
 
-_nat_num = re.compile(r"\d+")
+# --- типы чанков (для админ-обзора) ---
+_CHUNK_TYPES = (
+    "paragraph", "parent_rule", "list_item", "table",
+    "definition", "abbreviation", "appendix", "appendix_table", "section_title"
+)
 
+_nat_split = re.compile(r"(\d+)")
+
+# --- приоры по документам (мягкий буст) ---
+DOC_PRIORS: list[tuple[str, str, float]] = [
+    (r"\bву[-\s]?45\b|\bопробовани[ея]\b|\bсокращенн[ао]е\b", "808-2022 ПКБ ЦВ", 2.8),
+    (r"\bдиспетчер|\bманевр|\bпри[её]м|\bотправ|\bдц\b|\bаб\b", "291-ИДП", 2.4),
+    (r"\bконтактн(ая|ой) сеть|\bнатяжен|\bстрел[аы] провиса|\bркс\b", "1182-ЦЗ", 2.6),
+    (r"\bптэ\b|\bправила технической эксплуатации\b", "ПТЭ-544", 2.2),
+    (r"\bэ[пп]?т\b|\bавтотормоз|\bkz4at|kz8a|вл80", "854-ЦЗ", 2.0),
+]
 
 def _client():
-    """
-    Подключение к Weaviate по URL из env (например, http://weaviate-test:8080).
-    """
     u = urlparse.urlparse(WEAVIATE_URL)
     host = u.hostname or "weaviate-test"
     port = u.port or 8080
@@ -126,114 +61,43 @@ def _client():
         grpc_secure=False,
     )
 
-
 def ensure_schema():
-    """
-    Создаём коллекции без встроенного векторизатора, со "сплющенными" полями
-    и отдельным TEXT-полем meta_json для полного metadata.
-    """
+    from weaviate.classes import config as wcc
     with _client() as client:
         for cls in (RULES, DEFS, ABBR):
-            if not client.collections.exists(cls):
-                client.collections.create(
-                    cls,
-                    vectorizer_config=weaviate.classes.config.Configure.Vectorizer.none(),
-                    properties=[
-                        weaviate.classes.config.Property(
-                            name="chunk_id",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=True,
-                            index_searchable=True,
-                        ),
-                        weaviate.classes.config.Property(
-                            name="content",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=False,
-                            index_searchable=True,
-                        ),
-                        # плоские поля
-                        weaviate.classes.config.Property(
-                            name="language",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=True,
-                            index_searchable=False,
-                        ),
-                        weaviate.classes.config.Property(
-                            name="chunk_type",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=True,
-                            index_searchable=False,
-                        ),
-                        weaviate.classes.config.Property(
-                            name="source_document_id",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=True,
-                            index_searchable=False,
-                        ),
-                        weaviate.classes.config.Property(
-                            name="effective_date",
-                            data_type=weaviate.classes.config.DataType.DATE,
-                            index_filterable=True,
-                            index_searchable=False,
-                        ),
-                        weaviate.classes.config.Property(
-                            name="section_number",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=True,
-                            index_searchable=False,
-                        ),
-                        weaviate.classes.config.Property(
-                            name="chunk_rule_number",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=True,
-                            index_searchable=False,
-                        ),
-                        weaviate.classes.config.Property(
-                            name="parent_rule_number",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=True,
-                            index_searchable=False,
-                        ),
-                        # полный metadata как JSON-строка
-                        weaviate.classes.config.Property(
-                            name="meta_json",
-                            data_type=weaviate.classes.config.DataType.TEXT,
-                            index_filterable=False,
-                            index_searchable=False,
-                        ),
-                    ],
-                )
-
+            if client.collections.exists(cls):
+                continue
+            client.collections.create(
+                name=cls,
+                vector_config=wcc.Configure.Vector.none(),
+                properties=[
+                    wcc.Property(name="chunk_id",            data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=True),
+                    wcc.Property(name="content",             data_type=wcc.DataType.TEXT, index_filterable=False, index_searchable=True),
+                    wcc.Property(name="language",            data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=False),
+                    wcc.Property(name="chunk_type",          data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=False),
+                    wcc.Property(name="source_document_id",  data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=False),
+                    wcc.Property(name="effective_date",      data_type=wcc.DataType.DATE, index_filterable=True, index_searchable=False),
+                    wcc.Property(name="section_number",      data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=False),
+                    wcc.Property(name="chunk_rule_number",   data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=False),
+                    wcc.Property(name="parent_rule_number",  data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=False),
+                    wcc.Property(name="meta_json",           data_type=wcc.DataType.TEXT, index_filterable=False, index_searchable=False),
+                ],
+            )
 
 def reset_schema():
-    """
-    Полный сброс: дроп коллекций и пересоздание схемы.
-    """
     with _client() as client:
         for cls in (RULES, DEFS, ABBR):
             if client.collections.exists(cls):
                 client.collections.delete(cls)
-        # пересоздаём
-        ensure_schema()
-
+    ensure_schema()
 
 def wipe_all():
-    """
-    Очистка всех коллекций (truncate).
-    """
     with _client() as client:
         for cls in (RULES, DEFS, ABBR):
             if client.collections.exists(cls):
-                coll = client.collections.get(cls)
-                # удаляем всё без фильтра
-                coll.data.delete_many()  # доступно в v4 python-клиенте
-
+                client.collections.get(cls).data.delete_many()
 
 def delete_by_source_document_id(doc_id: str) -> Dict[str, Any]:
-    """
-    Удаляет все объекты с данным source_document_id из всех коллекций.
-    Возвращает примерную статистику (если клиент вернул её).
-    """
     stats: Dict[str, Any] = {}
     with _client() as client:
         for cls in (RULES, DEFS, ABBR):
@@ -242,58 +106,48 @@ def delete_by_source_document_id(doc_id: str) -> Dict[str, Any]:
             coll = client.collections.get(cls)
             where = weaviate.classes.query.Filter.by_property("source_document_id").equal(doc_id)
             resp = coll.data.delete_many(where=where)
-            # resp может быть None (в зависимости от версии). Сохраним как есть.
             stats[cls] = resp if resp is not None else "ok"
     return stats
 
-
 def collections_counts() -> Dict[str, int]:
-    """
-    Возвращает количество объектов по коллекциям.
-    """
-    out = {}
+    out: Dict[str, int] = {}
     with _client() as client:
         for cls in (RULES, DEFS, ABBR):
             if client.collections.exists(cls):
-                coll = client.collections.get(cls)
-                agg = coll.aggregate.over_all(total_count=True)
+                agg = client.collections.get(cls).aggregate.over_all(total_count=True)
                 out[cls] = int(getattr(agg, "total_count", 0))
             else:
                 out[cls] = 0
     return out
 
-
 def _pick_collection(chunk_type: str) -> str:
-    if chunk_type in ("definition",):
+    if chunk_type == "definition":
         return DEFS
-    if chunk_type in ("abbreviation",):
+    if chunk_type == "abbreviation":
         return ABBR
     return RULES
 
-
 def _to_rfc3339(date_str: str, end_of_day: bool = False) -> str:
-    """
-    "2024-11-07" -> "2024-11-07T00:00:00Z" или "...T23:59:59Z"
-    """
     if not date_str:
         return "1970-01-01T00:00:00Z"
     if "T" in date_str:
         return date_str
     return f"{date_str}{'T23:59:59Z' if end_of_day else 'T00:00:00Z'}"
 
-
 async def ingest_chunks(chunks: List[Chunk]) -> int:
-    """
-    Асинхронная загрузка чанков.
-    """
     texts = [f"passage: {c.content}" for c in chunks]
-    vecs = await embed_texts(texts)
+    vecs = await embed_texts(texts)  # список len(chunks), элементы np.ndarray или None
+    ok = [(c, v) for c, v in zip(chunks, vecs) if v is not None]
+    bad = [c.chunk_id for c, v in zip(chunks, vecs) if v is None]
+    if bad:
+        print(f"⚠️ embed skipped {len(bad)} items; first={bad[:3]}", file=sys.stderr)
+    if not ok:
+        raise RuntimeError("embedder_failed: no vectors")
 
     with _client() as client:
         count = 0
-        for c, v in zip(chunks, vecs):
+        for c, v in ok:
             coll = client.collections.get(_pick_collection(c.metadata.chunk_type))
-            meta = c.metadata.model_dump()
             props = {
                 "chunk_id": c.chunk_id,
                 "content": c.content,
@@ -304,62 +158,60 @@ async def ingest_chunks(chunks: List[Chunk]) -> int:
                 "section_number": c.metadata.section_number or "",
                 "chunk_rule_number": c.metadata.chunk_rule_number or "",
                 "parent_rule_number": c.metadata.parent_rule_number or "",
-                "meta_json": json.dumps(meta, ensure_ascii=False),
+                "meta_json": json.dumps(c.metadata.model_dump(), ensure_ascii=False),
             }
-            coll.data.insert(properties=props, vector=v.tolist())
+            coll.data.insert(properties=props, vector=np.asarray(v, dtype=np.float32).tolist())
             count += 1
     return count
 
-
 def _natural_key(s: str) -> list:
-    # "3.10.2" -> [3, '.', 10, '.', 2] для корректной сортировки
     s = (s or "").lower()
-    return [int(text) if text.isdigit() else text for text in _nat_num.split(s) for text in (text,)]
-
+    parts = _nat_split.split(s)
+    return [int(p) if p.isdigit() else p for p in parts]
 
 def _parse_date(s) -> datetime:
-    """
-    Принимает datetime | date | str | None и возвращает naive datetime (UTC-наивный).
-    Поддерживает строки 'YYYY-MM-DD' и RFC3339 ('YYYY-MM-DDTHH:MM:SSZ' / +00:00).
-    """
     if s is None:
         return datetime(1970, 1, 1)
-
     if isinstance(s, datetime):
         return s.replace(tzinfo=None)
-
     if isinstance(s, date):
         return datetime(s.year, s.month, s.day)
-
     if not isinstance(s, str):
         s = str(s)
-
     s = s.strip()
     if not s:
         return datetime(1970, 1, 1)
-
     if "T" in s:
         iso = s.replace("Z", "+00:00")
         try:
             return datetime.fromisoformat(iso).replace(tzinfo=None)
         except Exception:
             pass
-
     try:
         return datetime.fromisoformat(s)
     except Exception:
         return datetime(1970, 1, 1)
 
+# --- безопасный эмбеддинг запроса с фолбэком ---
+def _clean_query(q: str) -> str:
+    q = (q or "").replace("\x00", " ").strip()
+    return q[:2000]
 
-async def _embed_query(q: str) -> list[float]:
-    """Эмбеддинг для текста запроса (одним вызовом, без внешних зависимостей)."""
-    return (await _cached_embed_query(q)).tolist()
+async def _embed_query_optional(q: str) -> Optional[List[float]]:
+    q = _clean_query(q)
+    vecs = await embed_texts([f"query: {q}"], batch_size=1)
+    v = vecs[0] if isinstance(vecs, list) else vecs[0]
+    if v is None:
+        return None
+    return np.asarray(v, dtype=np.float32).tolist()
 
-
-def _alpha_for_query(q: str) -> float:
+def _alpha_for_query(q: str, has_vec: bool) -> float:
+    if not has_vec:
+        return 0.0
     toks = len([t for t in q.strip().split() if t])
-    return HYBRID_ALPHA_SHORT if toks < 5 else HYBRID_ALPHA_LONG
-
+    has_number = bool(re.search(r"\d", q))
+    base = HYBRID_ALPHA_SHORT if toks < 5 else HYBRID_ALPHA_LONG
+    return max(0.45, base - 0.06) if has_number else base
 
 def _doc_id_of(r: dict) -> str:
     try:
@@ -367,69 +219,98 @@ def _doc_id_of(r: dict) -> str:
     except Exception:
         return r.get("source_document_id") or ""
 
-
 def _eff_date_of(r: dict):
     try:
         return r.get("effective_date") or json.loads(r.get("meta_json", "{}")).get("effective_date")
     except Exception:
         return r.get("effective_date")
 
+async def _attach_vectors_locally(rows: List[Dict[str, Any]], top_n: int = 256) -> None:
+    if not rows:
+        return
+    sorted_idx = sorted(range(len(rows)), key=lambda i: float(rows[i].get("_score") or 0.0), reverse=True)
+    take_idx = sorted_idx[: min(top_n, len(rows))]
+    payload = [f"passage: {(rows[i].get('content') or '').strip()}" for i in take_idx]
+    if not any(t.strip() for t in payload):
+        for i in range(len(rows)):
+            rows[i]["_vec"] = None
+        return
+    vecs = await embed_texts(payload, batch_size=32)
 
-async def _hybrid_search(
+    if isinstance(vecs, np.ndarray):
+        m = min(vecs.shape[0], len(take_idx))
+        get_vec = lambda j: vecs[j, :]
+    else:
+        m = min(len(vecs), len(take_idx))
+        get_vec = lambda j: vecs[j]
+
+    for j in range(m):
+        i = take_idx[j]
+        v = get_vec(j)
+        try:
+            v = np.asarray(v, dtype=np.float32)
+        except Exception:
+            v = None
+        rows[i]["_vec"] = v
+    for j in range(m, len(take_idx)):
+        rows[take_idx[j]]["_vec"] = None
+    for i in sorted_idx[min(top_n, len(rows)):]:
+        rows[i]["_vec"] = None
+
+# --- поиск с фолбэком BM25 ---
+async def _search_collection(
     collection,
     query: str,
     k: int,
     language: str,
     today_rfc3339: str,
-    qv: list[float],
+    qv: Optional[List[float]],
     alpha: float,
-    doc_id: str | None = None,   # ← добавили
+    doc_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    # 1) Собираем фильтры
     fltrs = [
         weaviate.classes.query.Filter.by_property("language").equal(language),
         weaviate.classes.query.Filter.by_property("effective_date").less_or_equal(today_rfc3339),
     ]
     if doc_id:
         fltrs.append(weaviate.classes.query.Filter.by_property("source_document_id").equal(doc_id))
+    where = weaviate.classes.query.Filter.all_of(fltrs)
 
-    # 2) Запрос
-    res = collection.query.hybrid(
-        query=query,
-        vector=qv,
-        alpha=alpha,
-        limit=max(k, max(64, 3 * MMR_K)),  # запас на MMR/фильтры
-        return_properties=[
-            "chunk_id",
-            "content",
-            "meta_json",
-            "language",
-            "chunk_type",
-            "source_document_id",
-            "effective_date",
-            "section_number",
-            "chunk_rule_number",
-            "parent_rule_number",
-        ],
-        filters=weaviate.classes.query.Filter.all_of(fltrs),
-        return_metadata=MetadataQuery(score=True,vector=True),  # ← просим вектор
-    )
+    limit = max(k, max(64, 3 * MMR_K))
+    ret_props = [
+        "chunk_id", "content", "meta_json", "language", "chunk_type",
+        "source_document_id", "effective_date", "section_number",
+        "chunk_rule_number", "parent_rule_number",
+    ]
 
-    # 3) Преобразуем объекты
-    rows = []
+    if qv is not None:
+        res = collection.query.hybrid(
+            query=query,
+            vector=qv,
+            alpha=alpha,
+            limit=limit,
+            return_properties=ret_props,
+            filters=where,
+            return_metadata=MetadataQuery(score=True),
+        )
+    else:
+        res = collection.query.bm25(
+            query=query,
+            limit=limit,
+            return_properties=ret_props,
+            filters=where,
+            return_metadata=MetadataQuery(score=True),
+        )
+
+    rows: List[Dict[str, Any]] = []
     for o in res.objects:
         row = o.properties
         row["_score"] = getattr(o.metadata, "score", None)
-        try:
-            vec = getattr(o.metadata, "vector", None)
-            row["_vec"] = np.array(vec, dtype=np.float32) if vec is not None else None
-        except Exception:
-            row["_vec"] = None
+        row["_vec"] = None
         rows.append(row)
 
-    # 4) Оставляем только последнюю редакцию документа (если надо)
     if ONLY_LATEST_REV and rows:
-        max_dt: dict[str, datetime] = {}
+        max_dt: Dict[str, datetime] = {}
         for r in rows:
             doc = _doc_id_of(r)
             if not doc:
@@ -437,61 +318,65 @@ async def _hybrid_search(
             dt = _parse_date(_eff_date_of(r))
             if dt >= max_dt.get(doc, datetime(1970, 1, 1)):
                 max_dt[doc] = dt
+        rows = [r for r in rows if _doc_id_of(r) and _parse_date(_eff_date_of(r)) == max_dt[_doc_id_of(r)]]
 
-        filtered = []
-        for r in rows:
-            doc = _doc_id_of(r)
-            if not doc:
-                continue
-            dt = _parse_date(_eff_date_of(r))
-            if dt == max_dt.get(doc, datetime.min):
-                filtered.append(r)
-        rows = filtered
-
+    await _attach_vectors_locally(rows, top_n=max(256, 3 * MMR_K))
     return rows
 
-
-def _aggregate_docs(rows: list[dict]) -> list[tuple[str, float]]:
-    # агрегируем до уровня doc_id по max(_score)
-    agg: dict[str, float] = {}
+def _aggregate_docs(rows: List[dict]) -> List[tuple[str, float]]:
+    agg: Dict[str, float] = {}
     for r in rows:
         doc = _doc_id_of(r)
         if not doc:
             continue
-        sc = r.get("_score") or 0.0
+        sc = float(r.get("_score") or 0.0)
         if sc > agg.get(doc, -1e9):
             agg[doc] = sc
-    # убывающий топ документов
     return sorted(agg.items(), key=lambda x: x[1], reverse=True)
 
+def _apply_doc_priors(query: str, rows: List[dict]) -> Dict[str, float]:
+    q = query.lower()
+    prior: Dict[str, float] = {}
+    for pat, doc, w in DOC_PRIORS:
+        if re.search(pat, q):
+            prior[doc] = prior.get(doc, 0.0) + w
+    if not prior:
+        return {}
+    for r in rows:
+        d = _doc_id_of(r)
+        if d in prior:
+            r["_score"] = float(r.get("_score") or 0.0) + prior[d]
+    return prior
 
-def _mmr_select(cands: list[dict], k: int, lam: float) -> list[dict]:
-    """
-    MMR на косинусной близости по векторам (_vec), с лёгкой защитой от повторяющихся parent_rule_number.
-    lam в [0..1]: 1 — больше новизны, 0 — больше близости к запросу (т.е. score).
-    """
+def _boost_chunk_number_if_present(query: str, rows: List[dict]) -> None:
+    m = re.search(r"(?:п\.?|пункт)\s*(\d+(\.\d+)*)\b", (query or "").lower())
+    if not m:
+        return
+    want = m.group(1)
+    for r in rows:
+        crn = (r.get("chunk_rule_number") or "").strip(".")
+        if crn == want or crn.startswith(want + "."):
+            r["_score"] = float(r.get("_score") or 0.0) + 8.0
+
+def _mmr_select(cands: List[dict], k: int, lam: float) -> List[dict]:
     if not cands:
         return []
-
-    # нормализуем векторы (если нет _vec, считаем нулём — тогда работает «как раньше»)
-    vecs = []
-    for r in cands:
-        v = r.get("_vec")
-        if isinstance(v, np.ndarray) and v.size:
-            n = np.linalg.norm(v)
-            vecs.append(v / max(n, 1e-8))
-        else:
-            vecs.append(None)
-
-    # релевантность заменим на нормированный _score
     scores = np.array([float(r.get("_score") or 0.0) for r in cands], dtype=np.float32)
     if scores.max() > 0:
         scores = scores / scores.max()
 
-    selected = []
+    vecs = []
+    for r in cands:
+        v = r.get("_vec")
+        if isinstance(v, np.ndarray) and v.size:
+            n = float(np.linalg.norm(v))
+            vecs.append(v / max(n, 1e-8))
+        else:
+            vecs.append(None)
+
+    selected: List[int] = []
     used_prn = set()
 
-    # инициализация — берём лучший по score
     first = int(np.argmax(scores))
     selected.append(first)
     prn = cands[first].get("parent_rule_number") or cands[first].get("section_number") or ""
@@ -504,29 +389,18 @@ def _mmr_select(cands: list[dict], k: int, lam: float) -> list[dict]:
         for i in range(len(cands)):
             if i in selected:
                 continue
-
-            # новизна: 1 - max cosine(sim) до уже выбранных
-            if vecs[i] is None or all(vecs[j] is None for j in selected):
-                novelty = 1.0  # не знаем векторов — не штрафуем
-            else:
-                sims = []
-                for j in selected:
-                    if vecs[j] is None:
-                        continue
-                    sims.append(float(np.dot(vecs[i], vecs[j])))
-                novelty = 1.0 - (max(sims) if sims else 0.0)
-
-            mmr = lam * novelty + (1.0 - lam) * float(scores[i])
-
-            # лёгкая защита от повторов одного parent_rule_number
             prn_i = cands[i].get("parent_rule_number") or cands[i].get("section_number") or ""
+            if vecs[i] is None or all(vecs[j] is None for j in selected):
+                novelty = 1.0
+            else:
+                sims = [float(np.dot(vecs[i], vecs[j])) for j in selected if vecs[j] is not None]
+                novelty = 1.0 - (max(sims) if sims else 0.0)
             if prn_i in used_prn:
-                mmr *= 0.85  # маленький штраф
-
+                novelty *= 0.95
+            mmr = lam * novelty + (1.0 - lam) * float(scores[i])
             if mmr > best_val:
                 best_val = mmr
                 best_idx = i
-
         if best_idx is None:
             break
         selected.append(best_idx)
@@ -536,55 +410,74 @@ def _mmr_select(cands: list[dict], k: int, lam: float) -> list[dict]:
 
     return [cands[i] for i in selected]
 
-
 async def search(
     query: str,
     k_rules: int = 100,
     k_defs: int = 60,
-    language: str | None = None,
+    language: Optional[str] = None,
     today: str = "9999-12-31",
     doc_id: Optional[str] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Асинхронный поисковый вход — вызывай с await.
-    """
     lang = language or DEFAULT_LANG
     today_rfc3339 = _to_rfc3339(today, end_of_day=True)
 
-    # один эмбеддинг запроса на всё
-    qvec = await _embed_query(query)
-    alpha = _alpha_for_query(query)
+    qvec = await _embed_query_optional(query)  # может быть None
+    alpha = _alpha_for_query(query, has_vec=(qvec is not None))
+    if qvec is None:
+        print("⚠️ query_embedding=None → BM25 fallback", file=sys.stderr)
+
+    q_low = query.lower()
+    is_define = any(p in q_low for p in (
+        "что означает", "что такое", "дайте определение", "определение",
+        "расшифровка", "что означает сокращение", "что означает термин"
+    ))
 
     with _client() as client:
-        rules_all = await _hybrid_search(client.collections.get(RULES), query, k_rules, lang, today_rfc3339, qvec, alpha, doc_id)
-        defs_all  = await _hybrid_search(client.collections.get(DEFS),  query, min(k_defs, 30), lang, today_rfc3339, qvec, alpha, doc_id)
-        abbr_all  = await _hybrid_search(client.collections.get(ABBR),  query, min(k_defs, 30), lang, today_rfc3339, qvec, alpha, doc_id)
+        if is_define:
+            defs_all  = await _search_collection(client.collections.get(DEFS),  query, max(30, k_defs), lang, today_rfc3339, qvec, alpha, doc_id)
+            abbr_all  = await _search_collection(client.collections.get(ABBR),  query, max(30, k_defs), lang, today_rfc3339, qvec, alpha, doc_id)
+            rules_all = await _search_collection(client.collections.get(RULES), query, min(40, k_rules), lang, today_rfc3339, qvec, alpha, doc_id)
+        else:
+            rules_all = await _search_collection(client.collections.get(RULES), query, k_rules,        lang, today_rfc3339, qvec, alpha, doc_id)
+            defs_all  = await _search_collection(client.collections.get(DEFS),  query, min(k_defs,30), lang, today_rfc3339, qvec, alpha, doc_id)
+            abbr_all  = await _search_collection(client.collections.get(ABBR),  query, min(k_defs,30), lang, today_rfc3339, qvec, alpha, doc_id)
 
-    # --- DOC TOP-N: выбираем 1–3 лучших документов по Rules и режем кандидатов по ним ---
+    # точечные бусты до агрегации
+    _boost_chunk_number_if_present(query, rules_all)
+    prior = _apply_doc_priors(query, rules_all)
+
     doc_rank = _aggregate_docs(rules_all)
-    keep_docs: set[str]
-    if len(doc_rank) >= 2 and doc_rank[0][1] >= doc_rank[1][1] * (1 + MONODOC_MARGIN):
+    if not doc_rank:
+        return {"rules": [], "defs": [], "abbr": []}
+
+    # выбор корпуса документов (форс-монодок при явном номере пункта)
+    has_point = bool(re.search(r"\b(\d+(?:\.\d+)*)\b", query))
+    if has_point:
+        keep_docs: set[str] = {doc_rank[0][0]}
+    elif len(doc_rank) >= 2 and doc_rank[0][1] >= doc_rank[1][1] * (1 + MONODOC_MARGIN):
         keep_docs = {doc_rank[0][0]}
     else:
-        keep_docs = {d for d, _ in doc_rank[:max(1, DOC_TOPN)]} or {r.get("source_document_id") for r in rules_all[:1]}
-
+        if prior:
+            top_prior_doc = max(prior.items(), key=lambda x: x[1])[0]
+            keep_docs = {top_prior_doc}
+        else:
+            keep_docs = {d for d, _ in doc_rank[:max(1, DOC_TOPN)]} or {_doc_id_of(rules_all[0])}
 
     rules = [r for r in rules_all if (_doc_id_of(r) in keep_docs)]
-    # defs/abbr теперь ЖЁСТКО только из того же документа, что и якорь (а не просто из keep_docs)
-    anchor_doc_id = _doc_id_of(max(rules, key=lambda x: (x.get("_score") or 0.0))) if rules else None
-    defs_ = [r for r in defs_all if (_doc_id_of(r) == anchor_doc_id)]
-    abbr  = [r for r in abbr_all if (_doc_id_of(r) == anchor_doc_id)]
 
-    # --- MMR по Rules, чтобы не залипать в один подпункт ---
+    anchor_doc_id = _doc_id_of(max(rules, key=lambda x: (x.get("_score") or 0.0))) if rules else None
+    if is_define and anchor_doc_id is None and defs_all:
+        anchor_doc_id = _doc_id_of(defs_all[0])
+
+    defs_ = [r for r in defs_all if (anchor_doc_id is None or _doc_id_of(r) == anchor_doc_id)]
+    abbr = [r for r in abbr_all if (anchor_doc_id is None or _doc_id_of(r) == anchor_doc_id)]
+
+    # финальный отбор rule-кандидатов MMR
     rules = _mmr_select(rules, k=min(k_rules, MMR_K), lam=MMR_LAMBDA)
 
     return {"rules": rules, "defs": defs_, "abbr": abbr}
 
-
-def build_section_window(seed: Dict[str, Any], neighbors: int = 4) -> List[Dict[str, Any]]:
-    """
-    Окно вокруг пункта по parent_rule_number.
-    """
+def build_section_window(seed: Dict[str, Any], neighbors: int = 10) -> List[Dict[str, Any]]:
     parent = seed.get("parent_rule_number") or ""
     if not parent:
         return [seed]
@@ -594,23 +487,14 @@ def build_section_window(seed: Dict[str, Any], neighbors: int = 4) -> List[Dict[
         res = coll.query.fetch_objects(
             limit=200,
             return_properties=[
-                "chunk_id",
-                "content",
-                "meta_json",
-                "language",
-                "chunk_type",
-                "source_document_id",
-                "effective_date",
-                "section_number",
-                "chunk_rule_number",
-                "parent_rule_number",
+                "chunk_id", "content", "meta_json", "language", "chunk_type",
+                "source_document_id", "effective_date", "section_number",
+                "chunk_rule_number", "parent_rule_number",
             ],
-            filters=weaviate.classes.query.Filter.all_of(
-                [
-                    weaviate.classes.query.Filter.by_property("source_document_id").equal(sid),
-                    weaviate.classes.query.Filter.by_property("parent_rule_number").equal(parent),
-                ]
-            ),
+            filters=weaviate.classes.query.Filter.all_of([
+                weaviate.classes.query.Filter.by_property("source_document_id").equal(sid),
+                weaviate.classes.query.Filter.by_property("parent_rule_number").equal(parent),
+            ]),
         )
         all_items = sorted(
             [o.properties for o in res.objects],
@@ -622,29 +506,27 @@ def build_section_window(seed: Dict[str, Any], neighbors: int = 4) -> List[Dict[
             idx = next(i for i, x in enumerate(all_items) if x["chunk_id"] == seed["chunk_id"])
         except StopIteration:
             return [seed]
+
         lo, hi = max(0, idx - neighbors), min(len(all_items), idx + neighbors + 1)
         out = all_items[lo:hi]
-        # попробовать вставить сам родитель
+
         parent_rows = []
-        for x in all_items:
-            if x.get("chunk_rule_number") == parent:
-                parent_rows.append(x)
+        for it in all_items:
+            if it.get("chunk_rule_number") == parent:
+                parent_rows.append(it)
                 break
             try:
-                mj = json.loads(x.get("meta_json", "{}"))
-                if mj.get("chunk_type") == "parent_rule":
-                    parent_rows.append(x)
+                mj = json.loads(it.get("meta_json", "{}"))
+                if mj.get("chunk_type") == "parent_rule" and (mj.get("chunk_rule_number") == parent):
+                    parent_rows.append(it)
                     break
             except Exception:
                 pass
+
         out = (parent_rows[:1] + out)[: 1 + len(out)]
         return out or [seed]
 
-
 def to_evidence(items: List[Dict[str, Any]], why: str) -> List[Evidence]:
-    """
-    Формирование evidence для ответа.
-    """
     ev: List[Evidence] = []
     for it in items:
         try:
@@ -673,3 +555,50 @@ def to_evidence(items: List[Dict[str, Any]], why: str) -> List[Evidence]:
             )
         )
     return ev
+
+def chunk_types_overview(limit_per_type: int = 3, doc_id: Optional[str] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    with _client() as client:
+        for cls in (RULES, DEFS, ABBR):
+            if not client.collections.exists(cls):
+                out[cls] = {"total": 0, "by_type": {}}
+                continue
+
+            coll = client.collections.get(cls)
+
+            base_filters = []
+            if doc_id:
+                base_filters.append(weaviate.classes.query.Filter.by_property("source_document_id").equal(doc_id))
+            base_filter = weaviate.classes.query.Filter.all_of(base_filters) if base_filters else None
+
+            agg_total = coll.aggregate.over_all(total_count=True, filters=base_filter) if base_filter else coll.aggregate.over_all(total_count=True)
+            total = int(getattr(agg_total, "total_count", 0))
+            by_type: Dict[str, Any] = {}
+
+            for t in _CHUNK_TYPES:
+                fltrs = [weaviate.classes.query.Filter.by_property("chunk_type").equal(t)]
+                if base_filter is not None:
+                    fltrs.insert(0, base_filter)
+                    where = weaviate.classes.query.Filter.all_of(fltrs)
+                else:
+                    where = fltrs[0]
+
+                agg_t = coll.aggregate.over_all(total_count=True, filters=where)
+                cnt = int(getattr(agg_t, "total_count", 0))
+                if cnt <= 0:
+                    continue
+
+                res = coll.query.fetch_objects(
+                    limit=max(0, int(limit_per_type)),
+                    return_properties=[
+                        "chunk_id", "chunk_type", "source_document_id",
+                        "section_number", "chunk_rule_number", "parent_rule_number",
+                        "effective_date"
+                    ],
+                    filters=where,
+                )
+                samples = [o.properties for o in res.objects]
+                by_type[t] = {"count": cnt, "samples": samples}
+
+            out[cls] = {"total": total, "by_type": by_type}
+    return out

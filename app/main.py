@@ -1,3 +1,4 @@
+# app/main.py
 from __future__ import annotations
 
 import datetime
@@ -5,6 +6,7 @@ import io
 import json
 import zipfile
 from typing import Any, Dict, Iterator, List, Optional
+import re
 
 from fastapi import FastAPI, File, UploadFile
 
@@ -25,16 +27,20 @@ from .retriever import (
 )
 from .parser.pars import router as parser_router
 
+_CITE_RE = re.compile(r"\[[^\[\]]+ п\.[^\[\]]+\]$")
 
-# --- helpers: корректная кириллица в именах внутри ZIP ---
-UTF8_FLAG = 0x800  # general purpose bit 11 — "Language encoding flag (EFS)"
+def _ensure_citations(text: str, fallback_cite: str) -> str:
+    lines = [s.strip() for s in re.split(r"(?<=[\.\?\!])\s+", text) if s.strip()]
+    out = []
+    for s in lines:
+        out.append(s if _CITE_RE.search(s) else (s + " " + fallback_cite))
+    return " ".join(out)
+
+# --- ZIP helpers (кириллица) ---
+UTF8_FLAG = 0x800  # EFS flag
 
 
 def _guess_cyr_name(name: str) -> str:
-    """
-    zipfile, если нет UTF-8 флага, декодирует filename как cp437.
-    Пробуем восстановить: cp437->bytes->cp866/1251.
-    """
     try:
         raw = name.encode("cp437", errors="strict")
     except Exception:
@@ -48,34 +54,24 @@ def _guess_cyr_name(name: str) -> str:
 
 
 def _fix_zip_name(info: zipfile.ZipInfo) -> str:
-    # Если в заголовке выставлен UTF-8 флаг — имя уже корректное
     if info.flag_bits & UTF8_FLAG:
         return info.filename
-    # Иначе пытаемся восстановить кириллицу
     return _guess_cyr_name(info.filename)
 
 
 def _iter_jsonl_chunks(f: io.TextIOBase) -> Iterator[Chunk]:
-    """
-    Простой синхронный генератор: читаем построчно JSONL и валидируем через Pydantic.
-    Не держим весь файл в памяти.
-    """
-    for i, line in enumerate(f, 1):
+    for _i, line in enumerate(f, 1):
         s = line.strip()
         if not s:
             continue
         try:
             yield Chunk.model_validate_json(s)
         except Exception:
-            # тут можно логировать "плохие" строки
             continue
 
 
 async def _ingest_streaming(file_like: io.TextIOBase, batch_size: int = 1000) -> int:
-    """
-    Копим чанки батчами и вызываем ingest_chunks.
-    """
-    buf: list[Chunk] = []
+    buf: List[Chunk] = []
     total = 0
     for ch in _iter_jsonl_chunks(file_like):
         buf.append(ch)
@@ -87,7 +83,7 @@ async def _ingest_streaming(file_like: io.TextIOBase, batch_size: int = 1000) ->
     return total
 
 
-# === FastAPI app ===
+# === FastAPI ===
 app = FastAPI(title="KTZH RAG")
 
 
@@ -97,11 +93,14 @@ def startup() -> None:
 
 
 @app.get("/health")
-def health() -> Dict[str, bool]:
-    return {"ok": True}
+def health() -> Dict[str, Any]:
+    try:
+        return {"ok": True, "counts": collections_counts()}
+    except Exception as e:
+        return {"ok": True, "weaviate": "unavailable", "error": str(e)[:200]}
 
 
-# ---------- Админ/поддержка ----------
+# ---------- Админ ----------
 
 @app.get("/admin/stats")
 def admin_stats() -> Dict[str, Any]:
@@ -128,12 +127,6 @@ def admin_delete_all() -> Dict[str, Any]:
 
 @app.get("/admin/chunks/types")
 def admin_chunk_types(limit_per_type: int = 3, doc_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Обзор типов чанков в векторном хранилище.
-    Параметры:
-      - limit_per_type: сколько примеров вернуть на каждый chunk_type (по каждой коллекции)
-      - doc_id: опционально сузить статистику по конкретному документу (source_document_id)
-    """
     overview = chunk_types_overview(limit_per_type=limit_per_type, doc_id=doc_id)
     return {"kinds": overview}
 
@@ -149,19 +142,14 @@ async def ingest_zip(file: UploadFile = File(...)) -> Dict[str, Any]:
         return {"error": "bad_zip_file", "filename": file.filename}
 
     total_ingested = 0
-    per_file: list[dict[str, Any]] = []
+    per_file: List[Dict[str, Any]] = []
 
     for info in z.infolist():
-        # нормализуем имя (кириллица, nested/dir)
         safe_name = _fix_zip_name(info)
-
-        # пропускаем директории
         if info.is_dir():
             continue
-        # берём только *.jsonl (учитываем вложенные пути)
         if not safe_name.lower().endswith(".jsonl"):
             continue
-
         try:
             with z.open(info, "r") as fbin:
                 text_stream = io.TextIOWrapper(fbin, encoding="utf-8", errors="ignore")
@@ -181,7 +169,7 @@ async def ingest_zip(file: UploadFile = File(...)) -> Dict[str, Any]:
 
 @app.post("/ingest/jsonl/batch")
 async def ingest_jsonl_batch(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
-    results: list[dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
     total_ingested = 0
     for uf in files:
         try:
@@ -208,17 +196,36 @@ async def ingest_jsonl(file: UploadFile = File(...)) -> Dict[str, Any]:
 @app.post("/rag/answer")
 async def rag_answer(req: AnswerRequest) -> Dict[str, Any]:
     today = datetime.date.today().isoformat()
-    r = await search(req.query, req.k_rules, req.k_defs, language=req.language, today=today, doc_id=req.doc_id)
+    r = await search(
+        req.query,
+        req.k_rules,
+        req.k_defs,
+        language=req.language,
+        today=today,
+        doc_id=req.doc_id,
+    )
 
-    # Кандидаты на якорь из Rules
-    candidates = (r.get("rules") or [])
-
+    candidates = r.get("rules") or []
     if not candidates:
-        defs = r.get("defs", []) or []
-        abbr = r.get("abbr", []) or []
+        defs = r.get("defs") or []
+        abbr = r.get("abbr") or []
         pool = defs[:5] + abbr[:5]
-        from collections import Counter
 
+        if not pool and req.doc_id:
+            r2 = await search(
+                req.query,
+                req.k_rules,
+                req.k_defs,
+                language=req.language,
+                today=today,
+                doc_id=req.doc_id,
+            )
+            pool = (r2.get("defs") or []) + (r2.get("abbr") or [])
+
+        if not pool:
+            return {"answer": "По прямым нормам совпадений нет. Уточните пункт или документ.", "evidence": []}
+
+        from collections import Counter
         ids = [
             (json.loads(x.get("meta_json", "{}")).get("source_document_id") or x.get("source_document_id"))
             for x in pool
@@ -226,31 +233,28 @@ async def rag_answer(req: AnswerRequest) -> Dict[str, Any]:
         if ids:
             top_id, _ = Counter([i for i in ids if i]).most_common(1)[0]
             pool = [
-                x
-                for x in pool
-                if (json.loads(x.get("meta_json", "{}")).get("source_document_id") or x.get("source_document_id"))
-                == top_id
+                x for x in pool
+                if (json.loads(x.get("meta_json", "{}")).get("source_document_id") or x.get("source_document_id")) == top_id
             ]
+
         glossary_e = to_evidence(pool[:6], why="Глоссарий")
         user = render_user_prompt(req.query, glossary_e)
-        out = await chat(render_system_prompt(), user)
+        out = await chat(render_system_prompt(), user, temperature=0.0, max_tokens=800)
+        # гарантируем ссылки
+        fallback = f"[{glossary_e[0].doc['id']} п.{glossary_e[0].loc.get('chunk_rule_number') or '?'}]" if glossary_e else "[? п.?]"
+        out = _ensure_citations(out, fallback)
         return {"answer": out, "evidence": [e.model_dump() for e in glossary_e]}
 
-    # Берём лучший по _score
     anchor_raw = max(candidates, key=lambda x: (x.get("_score") or 0.0))
     anchor_e = to_evidence([anchor_raw], why="Якорная норма")[0]
 
-    # Окно раздела вокруг якоря
-    window_raw = build_section_window(anchor_raw, neighbors=4)
-    # убрать дубликат якоря:
+    window_raw = build_section_window(anchor_raw, neighbors=8)
     window_wo_anchor = [it for it in window_raw if it.get("chunk_id") != anchor_raw.get("chunk_id")]
     neighbors_e = to_evidence(window_wo_anchor[:6], why="Соседние подпункты")
 
-    # Глоссарий (defs/abbr)
     glossary_e = to_evidence((r.get("defs", [])[:2] + r.get("abbr", [])[:2]), why="Глоссарий")
 
-    # Cross-references из meta_json у якоря (если есть)
-    refs_e: list = []
+    refs_e: List[Dict[str, Any]] = []
     try:
         meta_anchor = json.loads(anchor_raw.get("meta_json", "{}"))
         xrefs = meta_anchor.get("cross_references") or []
@@ -261,7 +265,6 @@ async def rag_answer(req: AnswerRequest) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Упаковка + дедуп по cite
     evid = pack_evidence(anchor_e, neighbors_e, glossary_e, refs_e)
     seen = set()
     dedup = []
@@ -272,10 +275,12 @@ async def rag_answer(req: AnswerRequest) -> Dict[str, Any]:
         dedup.append(e)
     evid = dedup
 
-    # Ответ
     system = render_system_prompt()
     user = render_user_prompt(req.query, evid)
-    out = await chat(system, user)
+    out = await chat(system, user, temperature=0.15, max_tokens=900)
+    # гарантируем ссылки
+    fallback = f"[{anchor_e.doc['id']} п.{anchor_e.loc.get('chunk_rule_number') or '?'}]"
+    out = _ensure_citations(out, fallback)
     return {"answer": out, "evidence": [e.model_dump() for e in evid]}
 
 
