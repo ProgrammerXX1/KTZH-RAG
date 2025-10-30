@@ -39,3 +39,5 @@ class AnswerRequest(BaseModel):
     k_defs: int = 60
     need_versions_note: bool = True
     doc_id: Optional[str] = None
+    # добавлено: ID сессии/диалога для хранения последних 10 сообщений
+    conversation_id: Optional[str] = None

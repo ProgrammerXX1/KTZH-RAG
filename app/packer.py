@@ -1,5 +1,5 @@
 # app/packer.py
-from typing import List
+from typing import List, Optional, Dict
 from .models import Evidence
 from .config import CTX_BUDGET_TOKENS, EVIDENCE_HEADROOM
 
@@ -50,14 +50,26 @@ def render_system_prompt() -> str:
         "Если ответ опирается на несколько подпунктов, объединяй их в один абзац, но ставь ОТДЕЛЬНУЮ ссылку после каждого утверждения/цифры."
     )
 
-def render_user_prompt(question: str, evidences: List[Evidence]) -> str:
+def render_user_prompt(question: str, evidences: List[Evidence], history: Optional[List[Dict]] = None) -> str:
     blocks = []
     for e in evidences:
         ref = f"[{e.doc['id']} п.{e.loc.get('chunk_rule_number') or '?'}]"
         header = f"{ref} {e.doc['title']} (ред. {e.doc['version']} от {e.doc['effective_date']})"
         blocks.append(f"{header}\n{e.text}")
     evid_text = "\n\n---\n\n".join(blocks)
+
+    hist_text = ""
+    if history:
+        last = history[-10:]
+        lines = []
+        for turn in last:
+            role = turn.get("role","user")
+            content = (turn.get("content") or "")[:500]
+            lines.append(f"{role.upper()}: {content}")
+        hist_text = "Контекст предыдущего диалога:\n" + "\n".join(lines) + "\n\n"
+
     return (
+        f"{hist_text}"
         f"Вопрос: {question}\n\nНормативные фрагменты:\n\n{evid_text}\n\n"
         "Сформируй ответ строго по тексту фрагментов. "
         "Каждое ПРЕДЛОЖЕНИЕ обязано заканчиваться ссылкой [<doc_id> п.<chunk_rule_number>]. "

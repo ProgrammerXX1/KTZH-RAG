@@ -23,6 +23,13 @@ from .config import (
     ONLY_LATEST_REV,
     MONODOC_MARGIN,
 )
+from .config import (
+    REWRITER_ON,
+    REWRITER_TEMP,
+    REWRITER_MAX_TOKENS,
+    REWRITER_WEIGHT,
+)
+from .rewriter import rewrite_query
 from .embedder import embed_texts
 from .models import Chunk, Evidence
 
@@ -410,6 +417,17 @@ def _mmr_select(cands: List[dict], k: int, lam: float) -> List[dict]:
 
     return [cands[i] for i in selected]
 
+def _dedup_by_chunk_id(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        k = r.get("chunk_id")
+        sc = float(r.get("_score") or 0.0)
+        if not k:
+            continue
+        if (k not in best) or (sc > float(best[k].get("_score") or 0.0)):
+            best[k] = r
+    return list(best.values())
+
 async def search(
     query: str,
     k_rules: int = 100,
@@ -421,28 +439,63 @@ async def search(
     lang = language or DEFAULT_LANG
     today_rfc3339 = _to_rfc3339(today, end_of_day=True)
 
-    qvec = await _embed_query_optional(query)  # может быть None
-    alpha = _alpha_for_query(query, has_vec=(qvec is not None))
-    if qvec is None:
-        print("⚠️ query_embedding=None → BM25 fallback", file=sys.stderr)
+    # --- Query Rewriter: формируем варианты ---
+    variants: list[tuple[str, float]] = [(query, 1.0)]
+    if REWRITER_ON:
+        rw = await rewrite_query(query, temperature=REWRITER_TEMP, max_tokens=REWRITER_MAX_TOKENS)
+        can = (rw.get("canonical") or "").strip()
+        exs = [e.strip() for e in (rw.get("expansions") or []) if isinstance(e, str)]
+        for v in [can] + exs:
+            if v and v.lower() != query.lower():
+                variants.append((v, REWRITER_WEIGHT))
+        # убрать дубли формулировок
+        seen = set()
+        variants = [(v, w) for v, w in variants if not (v.lower() in seen or seen.add(v.lower()))]
 
-    q_low = query.lower()
-    is_define = any(p in q_low for p in (
-        "что означает", "что такое", "дайте определение", "определение",
-        "расшифровка", "что означает сокращение", "что означает термин"
-    ))
+    all_rules: List[Dict[str, Any]] = []
+    all_defs:  List[Dict[str, Any]] = []
+    all_abbr:  List[Dict[str, Any]] = []
 
     with _client() as client:
-        if is_define:
-            defs_all  = await _search_collection(client.collections.get(DEFS),  query, max(30, k_defs), lang, today_rfc3339, qvec, alpha, doc_id)
-            abbr_all  = await _search_collection(client.collections.get(ABBR),  query, max(30, k_defs), lang, today_rfc3339, qvec, alpha, doc_id)
-            rules_all = await _search_collection(client.collections.get(RULES), query, min(40, k_rules), lang, today_rfc3339, qvec, alpha, doc_id)
-        else:
-            rules_all = await _search_collection(client.collections.get(RULES), query, k_rules,        lang, today_rfc3339, qvec, alpha, doc_id)
-            defs_all  = await _search_collection(client.collections.get(DEFS),  query, min(k_defs,30), lang, today_rfc3339, qvec, alpha, doc_id)
-            abbr_all  = await _search_collection(client.collections.get(ABBR),  query, min(k_defs,30), lang, today_rfc3339, qvec, alpha, doc_id)
+        for q_text, weight in variants:
+            qvec = await _embed_query_optional(q_text)  # может быть None
+            alpha = _alpha_for_query(q_text, has_vec=(qvec is not None))
+            if qvec is None:
+                print("⚠️ query_embedding=None → BM25 fallback", file=sys.stderr)
 
-    # точечные бусты до агрегации
+            q_low = q_text.lower()
+            is_define = any(p in q_low for p in (
+                "что означает", "что такое", "дайте определение", "определение",
+                "расшифровка", "что означает сокращение", "что означает термин"
+            ))
+
+            if is_define:
+                defs_v  = await _search_collection(client.collections.get(DEFS),  q_text, max(30, k_defs), lang, today_rfc3339, qvec, alpha, doc_id)
+                abbr_v  = await _search_collection(client.collections.get(ABBR),  q_text, max(30, k_defs), lang, today_rfc3339, qvec, alpha, doc_id)
+                rules_v = await _search_collection(client.collections.get(RULES), q_text, min(40, k_rules), lang, today_rfc3339, qvec, alpha, doc_id)
+            else:
+                rules_v = await _search_collection(client.collections.get(RULES), q_text, k_rules,        lang, today_rfc3339, qvec, alpha, doc_id)
+                defs_v  = await _search_collection(client.collections.get(DEFS),  q_text, min(k_defs,30), lang, today_rfc3339, qvec, alpha, doc_id)
+                abbr_v  = await _search_collection(client.collections.get(ABBR),  q_text, min(k_defs,30), lang, today_rfc3339, qvec, alpha, doc_id)
+
+            # масштабируем скор под вклад варианта
+            for r in rules_v:
+                r["_score"] = float(r.get("_score") or 0.0) * float(weight)
+            for r in defs_v:
+                r["_score"] = float(r.get("_score") or 0.0) * float(weight)
+            for r in abbr_v:
+                r["_score"] = float(r.get("_score") or 0.0) * float(weight)
+
+            all_rules += rules_v
+            all_defs  += defs_v
+            all_abbr  += abbr_v
+
+    # дедуп по chunk_id
+    rules_all = _dedup_by_chunk_id(all_rules)
+    defs_all  = _dedup_by_chunk_id(all_defs)
+    abbr_all  = _dedup_by_chunk_id(all_abbr)
+
+    # точечные бусты до агрегации по документам — используем исходный запрос
     _boost_chunk_number_if_present(query, rules_all)
     prior = _apply_doc_priors(query, rules_all)
 
@@ -466,7 +519,7 @@ async def search(
     rules = [r for r in rules_all if (_doc_id_of(r) in keep_docs)]
 
     anchor_doc_id = _doc_id_of(max(rules, key=lambda x: (x.get("_score") or 0.0))) if rules else None
-    if is_define and anchor_doc_id is None and defs_all:
+    if any(p in (query or "").lower() for p in ("что означает", "что такое", "дайте определение", "определение", "расшифровка", "что означает сокращение", "что означает термин")) and anchor_doc_id is None and defs_all:
         anchor_doc_id = _doc_id_of(defs_all[0])
 
     defs_ = [r for r in defs_all if (anchor_doc_id is None or _doc_id_of(r) == anchor_doc_id)]
@@ -602,3 +655,11 @@ def chunk_types_overview(limit_per_type: int = 3, doc_id: Optional[str] = None) 
 
             out[cls] = {"total": total, "by_type": by_type}
     return out
+__all__ = [
+    "RULES","DEFS","ABBR",
+    "ensure_schema","reset_schema","wipe_all",
+    "delete_by_source_document_id","collections_counts",
+    "ingest_chunks","search","build_section_window",
+    "to_evidence","chunk_types_overview",
+    "_search_collection","_doc_id_of",
+]
