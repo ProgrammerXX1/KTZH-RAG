@@ -76,7 +76,7 @@ def ensure_schema():
                 continue
             client.collections.create(
                 name=cls,
-                vector_config=wcc.Configure.Vector.none(),
+                vectorizer_config=wcc.Configure.Vectorizer.none(),
                 properties=[
                     wcc.Property(name="chunk_id",            data_type=wcc.DataType.TEXT, index_filterable=True, index_searchable=True),
                     wcc.Property(name="content",             data_type=wcc.DataType.TEXT, index_filterable=False, index_searchable=True),

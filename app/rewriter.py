@@ -33,8 +33,6 @@ def _fallback_rule(q: str) -> Dict[str, List[str] | str]:
     ex: List[str] = []
     if any(t in q2 for t in ("что такое", "определение", "что означает", "расшифровка")):
         ex += ["определение термина", "что означает термин", "расшифровка сокращения"]
-    if "эпт" in q2 or "электропневмат" in q2:
-        ex += ["электропневматические тормоза", "ЭПТ"]
     ex = list(dict.fromkeys([e for e in ex if e not in q2]))[:3]
     return {"canonical": q2, "expansions": ex}
 
