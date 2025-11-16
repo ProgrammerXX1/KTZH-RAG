@@ -1,3 +1,4 @@
+# app/config.py
 import os
 from dotenv import load_dotenv
 
@@ -16,7 +17,7 @@ EMBEDDER_MODEL = os.getenv("EMBEDDER_MODEL", "e5-multilingual-large")
 # === LLM ===
 LLM_API_BASE = os.getenv("LLM_API_BASE", "http://92.46.59.74:8000/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "local")
-LLM_MODEL = os.getenv("LLM_MODEL", "gptoss-120b")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-oss-120b")
 
 # === Прочее ===
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ru")
@@ -33,7 +34,7 @@ EVIDENCE_HEADROOM  = int(os.getenv("EVIDENCE_HEADROOM", "600"))
 MONODOC_MARGIN     = float(os.getenv("MONODOC_MARGIN", "0.35"))  # было 0.08
 
 # --- Rewriter ---
-REWRITER_ON         = os.getenv("REWRITER_ON", "1") == "1"
+REWRITER_ON         = os.getenv("REWRITER_ON", "0") == "0"
 REWRITER_TEMP       = float(os.getenv("REWRITER_TEMP", "0.1"))
 REWRITER_MAX_TOKENS = int(os.getenv("REWRITER_MAX_TOKENS", "256"))
 REWRITER_WEIGHT     = float(os.getenv("REWRITER_WEIGHT", "0.9"))  # вклад переписанного поиска в скор
